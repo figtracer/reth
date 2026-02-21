@@ -1420,6 +1420,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
             if let Some(highest_tx) = highest_tx {
                 let mut last_block = highest_block.unwrap_or_default();
+                let initial_last_block = last_block;
                 debug!(target: "reth::providers::static_file", last_block, highest_tx, "Verifying last transaction matches last block indices");
                 loop {
                     let Some(indices) = provider.block_body_indices(last_block)? else {
@@ -1452,6 +1453,35 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     span.record("highest_block", last_block);
                     highest_block = Some(last_block);
                     update_unwind_target(last_block);
+                }
+
+                // If we walked the block back, the static file's on-disk block range
+                // is stale: it claims to cover blocks whose receipts/transactions were
+                // lost (e.g. due to a crash). Correct it now so the unwind pipeline
+                // doesn't hit a tx gap when it reads the stale block range.
+                if last_block < initial_last_block {
+                    info!(
+                        target: "reth::providers::static_file",
+                        from = initial_last_block,
+                        to = last_block,
+                        ?segment,
+                        "Correcting static file block range to match actual tx data."
+                    );
+                    let mut writer = self.latest_writer(segment)?;
+                    // prune with 0 rows updates the block range without removing tx data
+                    match segment {
+                        StaticFileSegment::Receipts => {
+                            writer.prune_receipts(0, last_block)?;
+                        }
+                        StaticFileSegment::Transactions => {
+                            writer.prune_transactions(0, last_block)?;
+                        }
+                        StaticFileSegment::TransactionSenders => {
+                            writer.prune_transaction_senders(0, last_block)?;
+                        }
+                        _ => {}
+                    }
+                    writer.commit()?;
                 }
             }
 

@@ -222,10 +222,49 @@ where
             // It can be equal when it's a chain of empty blocks, but we still need to update the
             // last block in the range.
             Ordering::Greater | Ordering::Equal => {
+                if next_static_file_receipt_num < next_receipt_num {
+                    // The static file's block range claims to cover up to the checkpoint,
+                    // but its tx count is behind what the checkpoint block expects. This
+                    // can happen after a crash where the block range was committed but
+                    // not all receipts were written. Correct the block range to match
+                    // the actual tx data, then signal the inconsistency.
+                    let last_valid_tx = next_static_file_receipt_num.saturating_sub(1);
+                    let mut corrected_block = static_file_block_num;
+                    while corrected_block > 0 {
+                        if let Some(indices) = provider.block_body_indices(corrected_block)?
+                            && indices.last_tx_num() <= last_valid_tx
+                        {
+                            break;
+                        }
+                        corrected_block -= 1;
+                    }
+
+                    // Update the static file's block range to match its actual tx data
+                    let mut writer =
+                        static_file_provider.latest_writer(StaticFileSegment::Receipts)?;
+                    writer.prune_receipts(0, corrected_block)?;
+                    writer.commit()?;
+
+                    // If we're already unwinding to a point at or before the corrected
+                    // block, the unwind will restore consistency.
+                    if let Some(unwind_to) = unwind_to &&
+                        unwind_to <= corrected_block
+                    {
+                        return Ok(())
+                    }
+
+                    return Err(missing_static_data_error(
+                        last_valid_tx,
+                        &static_file_provider,
+                        provider,
+                        StaticFileSegment::Receipts,
+                    )?)
+                }
+
                 let mut static_file_producer =
                     static_file_provider.latest_writer(StaticFileSegment::Receipts)?;
                 static_file_producer.prune_receipts(
-                    next_static_file_receipt_num.saturating_sub(next_receipt_num),
+                    next_static_file_receipt_num - next_receipt_num,
                     checkpoint,
                 )?;
                 // Since this is a database <-> static file inconsistency, we commit the change
