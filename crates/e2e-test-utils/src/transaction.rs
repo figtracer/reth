@@ -117,7 +117,7 @@ impl TransactionTestContext {
 
         let mut builder = SidecarBuilder::<SimpleCoder>::new();
         builder.ingest(b"dummy blob");
-        tx.set_blob_sidecar(builder.build()?);
+        tx.set_blob_sidecar(alloy_consensus::BlobTransactionSidecarVariant::Eip4844(builder.build::<alloy_consensus::BlobTransactionSidecar>()?));
         tx.set_max_fee_per_blob_gas(15e9 as u128);
 
         let signed = Self::sign_tx(wallet, tx).await;
