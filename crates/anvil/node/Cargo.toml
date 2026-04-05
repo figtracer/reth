@@ -8,6 +8,11 @@ homepage.workspace = true
 repository.workspace = true
 description = "Anvil dev node built on reth's node builder"
 
+[[bin]]
+name = "anvil-reth"
+path = "src/bin/anvil_reth.rs"
+required-features = ["cli"]
+
 [lints]
 workspace = true
 
@@ -53,6 +58,15 @@ eyre.workspace = true
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 parking_lot.workspace = true
 
+# cli (optional, for the binary)
+clap = { workspace = true, features = ["derive"], optional = true }
+alloy-genesis = { workspace = true, optional = true }
+alloy-signer-local = { workspace = true, features = ["mnemonic"], optional = true }
+reth-node-core = { workspace = true, optional = true }
+reth-tasks = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"], optional = true }
+futures = { workspace = true, optional = true }
+
 [dev-dependencies]
 reth-db.workspace = true
 reth-node-core.workspace = true
@@ -72,3 +86,13 @@ eyre.workspace = true
 
 [features]
 default = []
+cli = [
+    "dep:clap",
+    "dep:alloy-genesis",
+    "dep:alloy-signer-local",
+    "dep:reth-node-core",
+    "dep:reth-tasks",
+    "dep:tracing-subscriber",
+    "dep:futures",
+    "reth-node-builder/test-utils",
+]
