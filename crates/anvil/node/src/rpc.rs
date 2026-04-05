@@ -3,14 +3,16 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_anvil::{Forking, Metadata, MineOptions, NodeInfo};
 use alloy_rpc_types_engine::ExecutionData;
+use tokio_stream::wrappers::ReceiverStream;
 use jsonrpsee::core::{async_trait, RpcResult};
 use parking_lot::RwLock;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
+use reth_engine_local::{LocalMiner, MiningMode};
 use reth_engine_primitives::EngineTypes;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
-use reth_node_api::{FullNodeComponents, NodeAddOns};
+use reth_node_api::{FullNodeComponents, NodeAddOns, PayloadAttributesBuilder};
 use reth_node_builder::{
     rpc::{
         BasicEngineApiBuilder, BasicEngineValidatorBuilder, EngineApiBuilder,
@@ -30,10 +32,12 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
+use reth_storage_api::BlockReader;
 use reth_transaction_pool::TransactionPool;
 use reth_tracing::tracing::info;
 use revm::context::TxEnv;
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{collections::HashSet, fmt, marker::Unpin, sync::Arc};
+use tokio::sync::mpsc;
 
 /// Anvil-specific RPC add-ons.
 ///
@@ -83,11 +87,13 @@ impl<N, EthB, RpcMiddleware> NodeAddOns<N> for AnvilAddOns<N, EthB, RpcMiddlewar
 where
     N: FullNodeComponents<
         Types: NodeTypes<
-            ChainSpec: Hardforks + EthereumHardforks,
+            ChainSpec: Hardforks + EthereumHardforks + EthChainSpec + 'static,
             Primitives = EthPrimitives,
-            Payload: EngineTypes<ExecutionData = ExecutionData>,
+            Payload: EngineTypes<ExecutionData = ExecutionData>
+                         + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
         >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        Pool: Unpin,
     >,
     EthB: EthApiBuilder<N>,
     BasicEngineApiBuilder<EthereumEngineValidatorBuilder>: EngineApiBuilder<N>,
@@ -108,6 +114,31 @@ where
         let pool = ctx.node.pool().clone();
         let provider = ctx.node.provider().clone();
 
+        // mining trigger channel: RPC handler sends, miner receives
+        let (mine_tx, mine_rx) = mpsc::channel::<()>(64);
+
+        // use trigger-based mining so anvil_mine always works
+        let mining_mode: MiningMode<N::Pool> =
+            MiningMode::Trigger(Box::pin(ReceiverStream::new(mine_rx)));
+
+        let payload_attributes_builder = reth_engine_local::LocalPayloadAttributesBuilder::new(
+            ctx.config.chain.clone(),
+        );
+
+        let miner = LocalMiner::new(
+            ctx.node.provider().clone(),
+            payload_attributes_builder,
+            ctx.beacon_engine_handle.clone(),
+            mining_mode,
+            ctx.node.payload_builder_handle().clone(),
+        );
+
+        ctx.node.task_executor().spawn_critical_task("anvil local miner", async move {
+            miner.run().await
+        });
+
+        info!(target: "reth::cli", "Anvil local miner started");
+
         self.inner
             .launch_add_ons_with(ctx, move |container| {
                 container
@@ -115,7 +146,7 @@ where
                     .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
 
                 // register anvil_* namespace
-                let anvil_api = AnvilRpcHandler::new(pool, provider);
+                let anvil_api = AnvilRpcHandler::new(pool, provider, mine_tx);
                 container.modules.merge_configured(anvil_api.into_rpc())?;
 
                 info!(target: "reth::cli", "Anvil RPC extensions registered");
@@ -130,11 +161,13 @@ impl<N, EthB, RpcMiddleware> RethRpcAddOns<N> for AnvilAddOns<N, EthB, RpcMiddle
 where
     N: FullNodeComponents<
         Types: NodeTypes<
-            ChainSpec: Hardforks + EthereumHardforks,
+            ChainSpec: Hardforks + EthereumHardforks + EthChainSpec + 'static,
             Primitives = EthPrimitives,
-            Payload: EngineTypes<ExecutionData = ExecutionData>,
+            Payload: EngineTypes<ExecutionData = ExecutionData>
+                         + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
         >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        Pool: Unpin,
     >,
     EthB: EthApiBuilder<N>,
     BasicEngineApiBuilder<EthereumEngineValidatorBuilder>: EngineApiBuilder<N>,
@@ -165,6 +198,8 @@ pub struct AnvilRpcHandler<Pool, Provider> {
     pool: Pool,
     /// Provider for chain state queries.
     provider: Provider,
+    /// Trigger channel to request block mining.
+    mine_trigger: mpsc::Sender<()>,
     /// Accounts currently being impersonated.
     impersonated: Arc<RwLock<HashSet<Address>>>,
     /// Whether auto-impersonation is enabled.
@@ -188,6 +223,7 @@ impl<Pool: Clone, Provider: Clone> Clone for AnvilRpcHandler<Pool, Provider> {
         Self {
             pool: self.pool.clone(),
             provider: self.provider.clone(),
+            mine_trigger: self.mine_trigger.clone(),
             impersonated: self.impersonated.clone(),
             auto_impersonate: self.auto_impersonate.clone(),
             automine: self.automine.clone(),
@@ -196,11 +232,12 @@ impl<Pool: Clone, Provider: Clone> Clone for AnvilRpcHandler<Pool, Provider> {
 }
 
 impl<Pool, Provider> AnvilRpcHandler<Pool, Provider> {
-    /// Create a new handler with the given pool and provider.
-    pub fn new(pool: Pool, provider: Provider) -> Self {
+    /// Create a new handler with the given pool, provider, and mine trigger.
+    pub fn new(pool: Pool, provider: Provider, mine_trigger: mpsc::Sender<()>) -> Self {
         Self {
             pool,
             provider,
+            mine_trigger,
             impersonated: Arc::new(RwLock::new(HashSet::new())),
             auto_impersonate: Arc::new(RwLock::new(false)),
             automine: Arc::new(RwLock::new(true)),
@@ -244,8 +281,16 @@ where
 
     // -- mining (needs engine handle) --
 
-    async fn anvil_mine(&self, _blocks: Option<U256>, _interval: Option<U256>) -> RpcResult<()> {
-        Err(not_implemented("mine"))
+    async fn anvil_mine(&self, blocks: Option<U256>, _interval: Option<U256>) -> RpcResult<()> {
+        let count = blocks
+            .map(|b| b.try_into().unwrap_or(1u64))
+            .unwrap_or(1);
+        for _ in 0..count {
+            self.mine_trigger.send(()).await.map_err(|_| {
+                jsonrpsee::types::ErrorObject::owned(-32000, "mining service unavailable", None::<()>)
+            })?;
+        }
+        Ok(())
     }
 
     async fn anvil_set_interval_mining(&self, _interval: u64) -> RpcResult<()> {
