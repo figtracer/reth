@@ -22,6 +22,9 @@ use reth_provider::EthStorage;
 mod rpc;
 pub use rpc::*;
 
+pub mod state;
+pub use state::AnvilState;
+
 /// Anvil dev node type.
 ///
 /// Uses ethereum primitives and execution but adds anvil-specific RPC methods

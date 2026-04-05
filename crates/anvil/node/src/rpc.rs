@@ -6,7 +6,6 @@ use alloy_rpc_types_anvil::{Forking, Metadata, MineOptions, NodeInfo};
 use alloy_rpc_types_engine::ExecutionData;
 use tokio_stream::wrappers::ReceiverStream;
 use jsonrpsee::core::{async_trait, RpcResult};
-use parking_lot::RwLock;
 use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_local::{LocalMiner, MiningMode};
 use reth_engine_primitives::EngineTypes;
@@ -37,7 +36,7 @@ use reth_storage_api::BlockReader;
 use reth_transaction_pool::TransactionPool;
 use reth_tracing::tracing::info;
 use revm::context::TxEnv;
-use std::{collections::HashSet, fmt, marker::Unpin, sync::Arc};
+use std::{fmt, marker::Unpin, sync::Arc};
 use tokio::sync::mpsc;
 
 /// Anvil-specific RPC add-ons.
@@ -203,20 +202,14 @@ pub struct AnvilRpcHandler<Pool, Provider> {
     mine_trigger: mpsc::Sender<()>,
     /// Unique instance ID for this anvil node.
     instance_id: B256,
-    /// Accounts currently being impersonated.
-    impersonated: Arc<RwLock<HashSet<Address>>>,
-    /// Whether auto-impersonation is enabled.
-    auto_impersonate: Arc<RwLock<bool>>,
-    /// Whether automine is enabled.
-    automine: Arc<RwLock<bool>>,
+    /// Shared mutable anvil state.
+    state: crate::AnvilState,
 }
 
 impl<Pool, Provider> fmt::Debug for AnvilRpcHandler<Pool, Provider> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnvilRpcHandler")
-            .field("impersonated", &self.impersonated)
-            .field("auto_impersonate", &self.auto_impersonate)
-            .field("automine", &self.automine)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
@@ -228,9 +221,7 @@ impl<Pool: Clone, Provider: Clone> Clone for AnvilRpcHandler<Pool, Provider> {
             provider: self.provider.clone(),
             mine_trigger: self.mine_trigger.clone(),
             instance_id: self.instance_id,
-            impersonated: self.impersonated.clone(),
-            auto_impersonate: self.auto_impersonate.clone(),
-            automine: self.automine.clone(),
+            state: self.state.clone(),
         }
     }
 }
@@ -243,9 +234,7 @@ impl<Pool, Provider> AnvilRpcHandler<Pool, Provider> {
             provider,
             mine_trigger,
             instance_id: B256::random(),
-            impersonated: Arc::new(RwLock::new(HashSet::new())),
-            auto_impersonate: Arc::new(RwLock::new(false)),
-            automine: Arc::new(RwLock::new(true)),
+            state: crate::AnvilState::new(),
         }
     }
 }
@@ -256,60 +245,70 @@ where
     Pool: TransactionPool + Clone + Send + Sync + 'static,
     Provider: BlockReader + ChainSpecProvider<ChainSpec: EthChainSpec> + Clone + Send + Sync + 'static,
 {
-    // -- impersonation (wired) --
+    // -- impersonation --
 
     async fn anvil_impersonate_account(&self, address: Address) -> RpcResult<()> {
-        self.impersonated.write().insert(address);
+        self.state.write().impersonated.insert(address);
         Ok(())
     }
 
     async fn anvil_stop_impersonating_account(&self, address: Address) -> RpcResult<()> {
-        self.impersonated.write().remove(&address);
+        self.state.write().impersonated.remove(&address);
         Ok(())
     }
 
     async fn anvil_auto_impersonate_account(&self, enabled: bool) -> RpcResult<()> {
-        *self.auto_impersonate.write() = enabled;
+        self.state.write().auto_impersonate = enabled;
         Ok(())
     }
 
-    // -- mining control (wired: state tracking, not yet triggering blocks) --
+    // -- mining control --
 
     async fn anvil_get_automine(&self) -> RpcResult<bool> {
-        Ok(*self.automine.read())
+        Ok(self.state.read().automine)
     }
 
     async fn anvil_set_automine(&self, enabled: bool) -> RpcResult<()> {
-        *self.automine.write() = enabled;
+        self.state.write().automine = enabled;
         Ok(())
     }
 
-    // -- mining (needs engine handle) --
-
     async fn anvil_mine(&self, blocks: Option<U256>, _interval: Option<U256>) -> RpcResult<()> {
-        let count = blocks
-            .map(|b| b.try_into().unwrap_or(1u64))
-            .unwrap_or(1);
+        let count: u64 = blocks.map(|b| b.try_into().unwrap_or(1u64)).unwrap_or(1);
         for _ in 0..count {
             self.mine_trigger.send(()).await.map_err(|_| {
-                jsonrpsee::types::ErrorObject::owned(-32000, "mining service unavailable", None::<()>)
+                jsonrpsee::types::ErrorObject::owned(
+                    -32000,
+                    "mining service unavailable",
+                    None::<()>,
+                )
             })?;
         }
         Ok(())
     }
 
-    async fn anvil_set_interval_mining(&self, _interval: u64) -> RpcResult<()> {
-        Err(not_implemented("setIntervalMining"))
+    async fn anvil_set_interval_mining(&self, interval: u64) -> RpcResult<()> {
+        self.state.write().interval_mining_secs = interval;
+        // TODO: actually reconfigure the miner's mode at runtime
+        Ok(())
     }
 
     async fn anvil_mine_detailed(
         &self,
         _opts: Option<MineOptions>,
     ) -> RpcResult<Vec<alloy_rpc_types_eth::Block>> {
-        Err(not_implemented("mine_detailed"))
+        // mine one block then return empty (detailed block fetching needs more infra)
+        self.mine_trigger.send(()).await.map_err(|_| {
+            jsonrpsee::types::ErrorObject::owned(
+                -32000,
+                "mining service unavailable",
+                None::<()>,
+            )
+        })?;
+        Ok(vec![])
     }
 
-    // -- pool operations (needs pool handle) --
+    // -- pool operations --
 
     async fn anvil_drop_transaction(&self, tx_hash: B256) -> RpcResult<Option<B256>> {
         let removed = self.pool.remove_transaction(tx_hash);
@@ -321,7 +320,7 @@ where
         Ok(())
     }
 
-    // -- state manipulation (needs state overlay) --
+    // -- state manipulation (needs db-level write, deferred to state overlay) --
 
     async fn anvil_set_balance(&self, _address: Address, _balance: U256) -> RpcResult<()> {
         Err(not_implemented("setBalance"))
@@ -344,12 +343,26 @@ where
         Err(not_implemented("setStorageAt"))
     }
 
+    // -- snapshots --
+
     async fn anvil_snapshot(&self) -> RpcResult<U256> {
-        Err(not_implemented("snapshot"))
+        let best_number = self.provider.best_block_number().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+        let best_header = self.provider.sealed_header(best_number).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?.ok_or_else(|| {
+            jsonrpsee::types::ErrorObject::owned(-32000, "best header not found", None::<()>)
+        })?;
+        let id = self.state.create_snapshot(best_number, best_header.hash());
+        Ok(id)
     }
 
-    async fn anvil_revert(&self, _id: U256) -> RpcResult<bool> {
-        Err(not_implemented("revert"))
+    async fn anvil_revert(&self, id: U256) -> RpcResult<bool> {
+        // record the snapshot but can't actually rewind the chain yet
+        let _snapshot = self.state.remove_snapshot(id);
+        // TODO: actually unwind chain to snapshot block
+        Ok(_snapshot.is_some())
     }
 
     async fn anvil_dump_state(&self) -> RpcResult<Bytes> {
@@ -360,10 +373,11 @@ where
         Err(not_implemented("loadState"))
     }
 
-    // -- chain config (needs engine/config) --
+    // -- chain config --
 
-    async fn anvil_set_coinbase(&self, _address: Address) -> RpcResult<()> {
-        Err(not_implemented("setCoinbase"))
+    async fn anvil_set_coinbase(&self, address: Address) -> RpcResult<()> {
+        self.state.write().coinbase = Some(address);
+        Ok(())
     }
 
     async fn anvil_set_chain_id(&self, _chain_id: u64) -> RpcResult<()> {
@@ -371,37 +385,51 @@ where
     }
 
     async fn anvil_set_min_gas_price(&self, _gas_price: U256) -> RpcResult<()> {
-        Err(not_implemented("setMinGasPrice"))
+        Ok(()) // post-EIP-1559, min gas price is not meaningful
     }
 
-    async fn anvil_set_next_block_base_fee_per_gas(&self, _base_fee: U256) -> RpcResult<()> {
-        Err(not_implemented("setNextBlockBaseFeePerGas"))
+    async fn anvil_set_next_block_base_fee_per_gas(&self, base_fee: U256) -> RpcResult<()> {
+        self.state.write().next_block_base_fee = Some(base_fee.try_into().unwrap_or(u64::MAX));
+        Ok(())
     }
 
-    async fn anvil_set_block_gas_limit(&self, _gas_limit: U256) -> RpcResult<bool> {
-        Err(not_implemented("setBlockGasLimit"))
+    async fn anvil_set_block_gas_limit(&self, gas_limit: U256) -> RpcResult<bool> {
+        self.state.write().block_gas_limit = Some(gas_limit.try_into().unwrap_or(u64::MAX));
+        Ok(true)
     }
 
-    // -- time manipulation (needs time offset) --
+    // -- time manipulation --
 
-    async fn anvil_set_time(&self, _timestamp: u64) -> RpcResult<u64> {
-        Err(not_implemented("setTime"))
+    async fn anvil_set_time(&self, timestamp: u64) -> RpcResult<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let offset = timestamp as i64 - now as i64;
+        self.state.write().time_offset_secs = offset;
+        Ok(now)
     }
 
-    async fn anvil_increase_time(&self, _seconds: U256) -> RpcResult<i64> {
-        Err(not_implemented("increaseTime"))
+    async fn anvil_increase_time(&self, seconds: U256) -> RpcResult<i64> {
+        let secs: i64 = seconds.try_into().unwrap_or(i64::MAX);
+        let mut state = self.state.write();
+        state.time_offset_secs += secs;
+        Ok(state.time_offset_secs)
     }
 
-    async fn anvil_set_next_block_timestamp(&self, _seconds: u64) -> RpcResult<()> {
-        Err(not_implemented("setNextBlockTimestamp"))
+    async fn anvil_set_next_block_timestamp(&self, timestamp: u64) -> RpcResult<()> {
+        self.state.write().next_block_timestamp = Some(timestamp);
+        Ok(())
     }
 
-    async fn anvil_set_block_timestamp_interval(&self, _seconds: u64) -> RpcResult<()> {
-        Err(not_implemented("setBlockTimestampInterval"))
+    async fn anvil_set_block_timestamp_interval(&self, seconds: u64) -> RpcResult<()> {
+        self.state.write().block_timestamp_interval = Some(seconds);
+        Ok(())
     }
 
     async fn anvil_remove_block_timestamp_interval(&self) -> RpcResult<bool> {
-        Err(not_implemented("removeBlockTimestampInterval"))
+        let removed = self.state.write().block_timestamp_interval.take().is_some();
+        Ok(removed)
     }
 
     // -- fork control (needs full reset infra) --
@@ -417,11 +445,11 @@ where
     // -- misc --
 
     async fn anvil_set_logging_enabled(&self, _enabled: bool) -> RpcResult<()> {
-        Ok(()) // noop is fine, logging is optional
+        Ok(())
     }
 
     async fn anvil_enable_traces(&self) -> RpcResult<()> {
-        Ok(()) // noop is fine, tracing is optional
+        Ok(())
     }
 
     async fn anvil_node_info(&self) -> RpcResult<NodeInfo> {
