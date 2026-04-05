@@ -194,6 +194,33 @@ where
     }
 }
 
+impl<N, EthB, RpcMiddleware> reth_node_builder::rpc::EngineValidatorAddOn<N>
+    for AnvilAddOns<N, EthB, RpcMiddleware>
+where
+    N: FullNodeComponents<
+        Types: NodeTypes<
+            ChainSpec: Hardforks + EthereumHardforks + EthChainSpec + 'static,
+            Primitives = EthPrimitives,
+            Payload: EngineTypes<ExecutionData = ExecutionData>
+                         + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
+        >,
+        Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        Pool: Unpin,
+    >,
+    EthB: EthApiBuilder<N>,
+    BasicEngineApiBuilder<EthereumEngineValidatorBuilder>: EngineApiBuilder<N>,
+    BasicEngineValidatorBuilder<EthereumEngineValidatorBuilder>: EngineValidatorBuilder<N>,
+    EthApiError: FromEvmError<N::Evm>,
+    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
+    RpcMiddleware: Send,
+{
+    type ValidatorBuilder = BasicEngineValidatorBuilder<EthereumEngineValidatorBuilder>;
+
+    fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
+        BasicEngineValidatorBuilder::default()
+    }
+}
+
 /// Helper to return a standard "not yet implemented" RPC error.
 fn not_implemented(method: &str) -> jsonrpsee::types::ErrorObject<'static> {
     jsonrpsee::types::ErrorObject::owned(-32000, format!("anvil_{method}: not yet implemented"), None::<()>)

@@ -6,9 +6,12 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use reth_chainspec::ChainSpec;
+use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_ethereum_primitives::EthPrimitives;
+use reth_node_api::{FullNodeComponents, PayloadAttributesBuilder};
 use reth_node_builder::{
-    components::BasicPayloadServiceBuilder, node::FullNodeTypes, Node, NodeAdapter, NodeTypes,
+    components::BasicPayloadServiceBuilder, node::FullNodeTypes, DebugNode, Node, NodeAdapter,
+    NodeTypes,
 };
 use reth_node_ethereum::{
     node::{
@@ -17,7 +20,9 @@ use reth_node_ethereum::{
     },
     EthEngineTypes, EthereumPayloadBuilder,
 };
+use reth_payload_primitives::PayloadTypes;
 use reth_provider::EthStorage;
+use std::sync::Arc;
 
 mod payload;
 mod rpc;
@@ -34,6 +39,29 @@ pub use state::AnvilState;
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct AnvilNode;
+
+impl AnvilNode {
+    /// Returns a [`ComponentsBuilder`] configured for an anvil dev node.
+    pub fn components<Node>() -> reth_node_builder::components::ComponentsBuilder<
+        Node,
+        EthereumPoolBuilder,
+        BasicPayloadServiceBuilder<EthereumPayloadBuilder>,
+        EthereumNetworkBuilder,
+        EthereumExecutorBuilder,
+        EthereumConsensusBuilder,
+    >
+    where
+        Node: FullNodeTypes<Types = Self>,
+    {
+        reth_node_builder::components::ComponentsBuilder::default()
+            .node_types::<Node>()
+            .pool(EthereumPoolBuilder::default())
+            .executor(EthereumExecutorBuilder::default())
+            .payload(BasicPayloadServiceBuilder::default())
+            .network(EthereumNetworkBuilder::default())
+            .consensus(EthereumConsensusBuilder::default())
+    }
+}
 
 impl NodeTypes for AnvilNode {
     type Primitives = EthPrimitives;
@@ -69,5 +97,22 @@ where
 
     fn add_ons(&self) -> Self::AddOns {
         AnvilAddOns::default()
+    }
+}
+
+impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for AnvilNode {
+    type RpcBlock = alloy_rpc_types_eth::Block;
+
+    fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> reth_ethereum_primitives::Block {
+        rpc_block.into_consensus().convert_transactions()
+    }
+
+    fn local_payload_attributes_builder(
+        chain_spec: &Self::ChainSpec,
+    ) -> impl PayloadAttributesBuilder<
+        <Self::Payload as PayloadTypes>::PayloadAttributes,
+        reth_node_api::HeaderTy<Self>,
+    > {
+        LocalPayloadAttributesBuilder::new(Arc::new(chain_spec.clone()))
     }
 }
