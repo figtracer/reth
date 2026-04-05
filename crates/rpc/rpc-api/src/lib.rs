@@ -15,7 +15,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod admin;
-mod anvil;
+pub mod anvil;
 mod debug;
 mod engine;
 mod hardhat;

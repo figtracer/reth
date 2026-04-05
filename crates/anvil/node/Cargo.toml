@@ -1,0 +1,61 @@
+[package]
+name = "reth-node-anvil"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Anvil dev node built on reth's node builder"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-ethereum-engine-primitives.workspace = true
+reth-ethereum-primitives.workspace = true
+reth-node-builder.workspace = true
+reth-node-ethereum.workspace = true
+reth-tracing.workspace = true
+reth-provider.workspace = true
+reth-evm.workspace = true
+reth-rpc-api.workspace = true
+reth-rpc-eth-api.workspace = true
+reth-rpc-builder.workspace = true
+reth-rpc-server-types.workspace = true
+reth-rpc-eth-types.workspace = true
+reth-node-api.workspace = true
+reth-chainspec.workspace = true
+reth-engine-primitives.workspace = true
+reth-payload-primitives.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
+alloy-rpc-types-anvil.workspace = true
+alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-eth.workspace = true
+
+# revm
+revm.workspace = true
+
+# misc
+eyre.workspace = true
+jsonrpsee = { workspace = true, features = ["server", "macros"] }
+parking_lot.workspace = true
+
+[dev-dependencies]
+reth-db.workspace = true
+reth-node-core.workspace = true
+reth-e2e-test-utils.workspace = true
+reth-tasks.workspace = true
+
+alloy-primitives.workspace = true
+alloy-genesis.workspace = true
+
+futures.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []

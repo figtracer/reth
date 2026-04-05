@@ -35,6 +35,7 @@ members = [
     "crates/era-utils",
     "crates/errors/",
     "crates/ethereum/hardforks/",
+    "crates/anvil/node",
     "crates/ethereum/cli/",
     "crates/ethereum/consensus/",
     "crates/ethereum/engine-primitives/",
@@ -382,6 +383,7 @@ reth-network-p2p = { path = "crates/net/p2p" }
 reth-network-peers = { path = "crates/net/peers", default-features = false }
 reth-network-types = { path = "crates/net/network-types" }
 reth-nippy-jar = { path = "crates/storage/nippy-jar" }
+reth-node-anvil = { path = "crates/anvil/node" }
 reth-node-api = { path = "crates/node/api" }
 reth-node-builder = { path = "crates/node/builder" }
 reth-node-core = { path = "crates/node/core" }
