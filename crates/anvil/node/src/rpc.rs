@@ -5,7 +5,7 @@ use alloy_rpc_types_anvil::{Forking, Metadata, MineOptions, NodeInfo};
 use alloy_rpc_types_engine::ExecutionData;
 use jsonrpsee::core::{async_trait, RpcResult};
 use parking_lot::RwLock;
-use reth_chainspec::{EthereumHardforks, Hardforks};
+use reth_chainspec::{EthChainSpec, EthereumHardforks, Hardforks};
 use reth_engine_primitives::EngineTypes;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_ethereum_primitives::EthPrimitives;
@@ -21,6 +21,7 @@ use reth_node_builder::{
 };
 use reth_node_ethereum::node::{EthereumEngineValidatorBuilder, EthereumEthApiBuilder};
 use reth_payload_primitives::PayloadTypes;
+use reth_provider::ChainSpecProvider;
 use reth_rpc_api::anvil::AnvilApiServer;
 use reth_rpc_builder::middleware::RethRpcMiddleware;
 use reth_rpc_eth_api::{
@@ -29,9 +30,10 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
+use reth_transaction_pool::TransactionPool;
 use reth_tracing::tracing::info;
 use revm::context::TxEnv;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 /// Anvil-specific RPC add-ons.
 ///
@@ -103,6 +105,9 @@ where
         let eth_config =
             EthConfigHandler::new(ctx.node.provider().clone(), ctx.node.evm_config().clone());
 
+        let pool = ctx.node.pool().clone();
+        let provider = ctx.node.provider().clone();
+
         self.inner
             .launch_add_ons_with(ctx, move |container| {
                 container
@@ -110,7 +115,7 @@ where
                     .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
 
                 // register anvil_* namespace
-                let anvil_api = AnvilRpcHandler::new();
+                let anvil_api = AnvilRpcHandler::new(pool, provider);
                 container.modules.merge_configured(anvil_api.into_rpc())?;
 
                 info!(target: "reth::cli", "Anvil RPC extensions registered");
@@ -152,10 +157,14 @@ fn not_implemented(method: &str) -> jsonrpsee::types::ErrorObject<'static> {
 
 /// Anvil RPC handler.
 ///
+/// Generic over `Pool` (transaction pool) and `Provider` (chain state).
 /// Methods that are wired return real results. Unimplemented methods return
 /// explicit errors so callers don't mistake a noop for success.
-#[derive(Debug, Clone)]
-pub struct AnvilRpcHandler {
+pub struct AnvilRpcHandler<Pool, Provider> {
+    /// Transaction pool handle.
+    pool: Pool,
+    /// Provider for chain state queries.
+    provider: Provider,
     /// Accounts currently being impersonated.
     impersonated: Arc<RwLock<HashSet<Address>>>,
     /// Whether auto-impersonation is enabled.
@@ -164,10 +173,34 @@ pub struct AnvilRpcHandler {
     automine: Arc<RwLock<bool>>,
 }
 
-impl AnvilRpcHandler {
-    /// Create a new handler with defaults (automine on, no impersonation).
-    pub fn new() -> Self {
+impl<Pool, Provider> fmt::Debug for AnvilRpcHandler<Pool, Provider> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnvilRpcHandler")
+            .field("impersonated", &self.impersonated)
+            .field("auto_impersonate", &self.auto_impersonate)
+            .field("automine", &self.automine)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Pool: Clone, Provider: Clone> Clone for AnvilRpcHandler<Pool, Provider> {
+    fn clone(&self) -> Self {
         Self {
+            pool: self.pool.clone(),
+            provider: self.provider.clone(),
+            impersonated: self.impersonated.clone(),
+            auto_impersonate: self.auto_impersonate.clone(),
+            automine: self.automine.clone(),
+        }
+    }
+}
+
+impl<Pool, Provider> AnvilRpcHandler<Pool, Provider> {
+    /// Create a new handler with the given pool and provider.
+    pub fn new(pool: Pool, provider: Provider) -> Self {
+        Self {
+            pool,
+            provider,
             impersonated: Arc::new(RwLock::new(HashSet::new())),
             auto_impersonate: Arc::new(RwLock::new(false)),
             automine: Arc::new(RwLock::new(true)),
@@ -176,7 +209,11 @@ impl AnvilRpcHandler {
 }
 
 #[async_trait]
-impl AnvilApiServer for AnvilRpcHandler {
+impl<Pool, Provider> AnvilApiServer for AnvilRpcHandler<Pool, Provider>
+where
+    Pool: TransactionPool + Clone + Send + Sync + 'static,
+    Provider: ChainSpecProvider<ChainSpec: EthChainSpec> + Clone + Send + Sync + 'static,
+{
     // -- impersonation (wired) --
 
     async fn anvil_impersonate_account(&self, address: Address) -> RpcResult<()> {
@@ -224,12 +261,14 @@ impl AnvilApiServer for AnvilRpcHandler {
 
     // -- pool operations (needs pool handle) --
 
-    async fn anvil_drop_transaction(&self, _tx_hash: B256) -> RpcResult<Option<B256>> {
-        Err(not_implemented("dropTransaction"))
+    async fn anvil_drop_transaction(&self, tx_hash: B256) -> RpcResult<Option<B256>> {
+        let removed = self.pool.remove_transaction(tx_hash);
+        Ok(removed.map(|_| tx_hash))
     }
 
-    async fn anvil_remove_pool_transactions(&self, _address: Address) -> RpcResult<()> {
-        Err(not_implemented("removePoolTransactions"))
+    async fn anvil_remove_pool_transactions(&self, address: Address) -> RpcResult<()> {
+        self.pool.remove_transactions_by_sender(address);
+        Ok(())
     }
 
     // -- state manipulation (needs state overlay) --
