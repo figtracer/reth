@@ -19,7 +19,9 @@ use reth_node_ethereum::{
 };
 use reth_provider::EthStorage;
 
+mod payload;
 mod rpc;
+pub use payload::AnvilPayloadAttributesBuilder;
 pub use rpc::*;
 
 pub mod state;

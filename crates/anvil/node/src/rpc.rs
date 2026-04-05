@@ -114,6 +114,9 @@ where
         let pool = ctx.node.pool().clone();
         let provider = ctx.node.provider().clone();
 
+        // shared state between RPC handler and payload builder
+        let anvil_state = crate::AnvilState::new();
+
         // mining trigger channel: RPC handler sends, miner receives
         let (mine_tx, mine_rx) = mpsc::channel::<()>(64);
 
@@ -121,8 +124,10 @@ where
         let mining_mode: MiningMode<N::Pool> =
             MiningMode::Trigger(Box::pin(ReceiverStream::new(mine_rx)));
 
-        let payload_attributes_builder = reth_engine_local::LocalPayloadAttributesBuilder::new(
+        // payload builder applies anvil overrides (timestamp, coinbase, etc)
+        let payload_attributes_builder = crate::AnvilPayloadAttributesBuilder::new(
             ctx.config.chain.clone(),
+            anvil_state.clone(),
         );
 
         let miner = LocalMiner::new(
@@ -133,11 +138,16 @@ where
             ctx.node.payload_builder_handle().clone(),
         );
 
-        ctx.node.task_executor().spawn_critical_task("anvil local miner", async move {
-            miner.run().await
-        });
+        ctx.node
+            .task_executor()
+            .spawn_critical_task("anvil local miner", async move {
+                miner.run().await
+            });
 
         info!(target: "reth::cli", "Anvil local miner started");
+
+        // clone state for the RPC handler
+        let handler_state = anvil_state;
 
         self.inner
             .launch_add_ons_with(ctx, move |container| {
@@ -146,7 +156,8 @@ where
                     .merge_if_module_configured(RethRpcModule::Eth, eth_config.into_rpc())?;
 
                 // register anvil_* namespace
-                let anvil_api = AnvilRpcHandler::new(pool, provider, mine_tx);
+                let mut anvil_api = AnvilRpcHandler::new(pool, provider, mine_tx);
+                anvil_api.state = handler_state;
                 container.modules.merge_configured(anvil_api.into_rpc())?;
 
                 info!(target: "reth::cli", "Anvil RPC extensions registered");
