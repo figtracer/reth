@@ -32,7 +32,7 @@ use reth_rpc_eth_api::{
 };
 use reth_rpc_eth_types::{error::FromEvmError, EthApiError};
 use reth_rpc_server_types::RethRpcModule;
-use reth_storage_api::BlockReader;
+use reth_storage_api::{AccountReader, BlockReader, DBProvider};
 use reth_transaction_pool::TransactionPool;
 use reth_tracing::tracing::info;
 use revm::context::TxEnv;
@@ -92,6 +92,10 @@ where
             Payload: EngineTypes<ExecutionData = ExecutionData>
                          + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
         >,
+        Provider: AccountReader
+            + reth_storage_api::DatabaseProviderFactory<
+                ProviderRW: reth_storage_api::StateWriter + DBProvider,
+            >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
         Pool: Unpin,
     >,
@@ -177,6 +181,10 @@ where
             Payload: EngineTypes<ExecutionData = ExecutionData>
                          + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
         >,
+        Provider: AccountReader
+            + reth_storage_api::DatabaseProviderFactory<
+                ProviderRW: reth_storage_api::StateWriter + DBProvider,
+            >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
         Pool: Unpin,
     >,
@@ -204,6 +212,10 @@ where
             Payload: EngineTypes<ExecutionData = ExecutionData>
                          + PayloadTypes<PayloadAttributes = EthPayloadAttributes>,
         >,
+        Provider: AccountReader
+            + reth_storage_api::DatabaseProviderFactory<
+                ProviderRW: reth_storage_api::StateWriter + DBProvider,
+            >,
         Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
         Pool: Unpin,
     >,
@@ -281,7 +293,14 @@ impl<Pool, Provider> AnvilRpcHandler<Pool, Provider> {
 impl<Pool, Provider> AnvilApiServer for AnvilRpcHandler<Pool, Provider>
 where
     Pool: TransactionPool + Clone + Send + Sync + 'static,
-    Provider: BlockReader + ChainSpecProvider<ChainSpec: EthChainSpec> + Clone + Send + Sync + 'static,
+    Provider: BlockReader
+        + AccountReader
+        + ChainSpecProvider<ChainSpec: EthChainSpec>
+        + reth_storage_api::DatabaseProviderFactory<ProviderRW: reth_storage_api::StateWriter + reth_storage_api::DBProvider>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     // -- impersonation --
 
@@ -358,27 +377,148 @@ where
         Ok(())
     }
 
-    // -- state manipulation (needs db-level write, deferred to state overlay) --
+    // -- state manipulation (writes directly to DB) --
 
-    async fn anvil_set_balance(&self, _address: Address, _balance: U256) -> RpcResult<()> {
-        Err(not_implemented("setBalance"))
+    async fn anvil_set_balance(&self, address: Address, balance: U256) -> RpcResult<()> {
+        use reth_storage_api::{DatabaseProviderFactory, StateWriter};
+        use revm::state::AccountInfo;
+        use revm::database::states::changes::StateChangeset;
+
+        let provider_rw = self.provider.database_provider_rw().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        // read current account, modify balance
+        let mut info = self.provider.basic_account(&address).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?.unwrap_or_default();
+        info.balance = balance;
+
+        let changeset = StateChangeset {
+            accounts: vec![(address, Some(AccountInfo {
+                balance: info.balance,
+                nonce: info.nonce,
+                code_hash: info.bytecode_hash.unwrap_or(revm::primitives::KECCAK_EMPTY),
+                code: Default::default(),
+                account_id: None,
+            }))],
+            ..Default::default()
+        };
+
+        provider_rw.write_state_changes(changeset).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+        provider_rw.commit().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        Ok(())
     }
 
-    async fn anvil_set_code(&self, _address: Address, _code: Bytes) -> RpcResult<()> {
-        Err(not_implemented("setCode"))
+    async fn anvil_set_code(&self, address: Address, code: Bytes) -> RpcResult<()> {
+        use reth_storage_api::{DatabaseProviderFactory, StateWriter};
+        use revm::state::AccountInfo;
+        use revm::database::states::changes::StateChangeset;
+        use revm::bytecode::Bytecode;
+
+        let provider_rw = self.provider.database_provider_rw().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        let bytecode = Bytecode::new_raw(code.clone());
+        let code_hash = bytecode.hash_slow();
+
+        let mut info = self.provider.basic_account(&address).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?.unwrap_or_default();
+
+        let changeset = StateChangeset {
+            accounts: vec![(address, Some(AccountInfo {
+                balance: info.balance,
+                nonce: info.nonce,
+                code_hash,
+                code: Some(bytecode.clone()),
+                account_id: None,
+            }))],
+            contracts: vec![(code_hash, bytecode)],
+            ..Default::default()
+        };
+
+        provider_rw.write_state_changes(changeset).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+        provider_rw.commit().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        Ok(())
     }
 
-    async fn anvil_set_nonce(&self, _address: Address, _nonce: U256) -> RpcResult<()> {
-        Err(not_implemented("setNonce"))
+    async fn anvil_set_nonce(&self, address: Address, nonce: U256) -> RpcResult<()> {
+        use reth_storage_api::{DatabaseProviderFactory, StateWriter};
+        use revm::state::AccountInfo;
+        use revm::database::states::changes::StateChangeset;
+
+        let provider_rw = self.provider.database_provider_rw().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        let mut info = self.provider.basic_account(&address).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?.unwrap_or_default();
+        let nonce_u64: u64 = nonce.try_into().unwrap_or(u64::MAX);
+
+        let changeset = StateChangeset {
+            accounts: vec![(address, Some(AccountInfo {
+                balance: info.balance,
+                nonce: nonce_u64,
+                code_hash: info.bytecode_hash.unwrap_or(revm::primitives::KECCAK_EMPTY),
+                code: Default::default(),
+                account_id: None,
+            }))],
+            ..Default::default()
+        };
+
+        provider_rw.write_state_changes(changeset).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+        provider_rw.commit().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        Ok(())
     }
 
     async fn anvil_set_storage_at(
         &self,
-        _address: Address,
-        _slot: U256,
-        _value: B256,
+        address: Address,
+        slot: U256,
+        value: B256,
     ) -> RpcResult<bool> {
-        Err(not_implemented("setStorageAt"))
+        use reth_storage_api::{DatabaseProviderFactory, StateWriter};
+        use revm::database::states::changes::{PlainStorageChangeset, StateChangeset};
+
+        let provider_rw = self.provider.database_provider_rw().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        let changeset = StateChangeset {
+            storage: vec![PlainStorageChangeset {
+                address,
+                wipe_storage: false,
+                storage: vec![(slot.into(), value.into())],
+            }],
+            ..Default::default()
+        };
+
+        provider_rw.write_state_changes(changeset).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+        provider_rw.commit().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+
+        Ok(true)
     }
 
     // -- snapshots --

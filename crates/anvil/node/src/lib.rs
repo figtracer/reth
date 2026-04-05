@@ -72,7 +72,13 @@ impl NodeTypes for AnvilNode {
 
 impl<N> Node<N> for AnvilNode
 where
-    N: FullNodeTypes<Types = Self>,
+    N: FullNodeTypes<
+        Types = Self,
+        Provider: reth_storage_api::AccountReader
+            + reth_storage_api::DatabaseProviderFactory<
+                ProviderRW: reth_storage_api::StateWriter + reth_storage_api::DBProvider,
+            >,
+    >,
 {
     type ComponentsBuilder = reth_node_builder::components::ComponentsBuilder<
         N,
@@ -100,7 +106,16 @@ where
     }
 }
 
-impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for AnvilNode {
+impl<N> DebugNode<N> for AnvilNode
+where
+    N: FullNodeComponents<
+        Types = Self,
+        Provider: reth_storage_api::AccountReader
+            + reth_storage_api::DatabaseProviderFactory<
+                ProviderRW: reth_storage_api::StateWriter + reth_storage_api::DBProvider,
+            >,
+    >,
+{
     type RpcBlock = alloy_rpc_types_eth::Block;
 
     fn rpc_to_primitive_block(rpc_block: Self::RpcBlock) -> reth_ethereum_primitives::Block {
