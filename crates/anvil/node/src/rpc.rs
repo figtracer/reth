@@ -145,14 +145,21 @@ where
     }
 }
 
+/// Helper to return a standard "not yet implemented" RPC error.
+fn not_implemented(method: &str) -> jsonrpsee::types::ErrorObject<'static> {
+    jsonrpsee::types::ErrorObject::owned(-32000, format!("anvil_{method}: not yet implemented"), None::<()>)
+}
+
 /// Anvil RPC handler.
 ///
-/// This is a stub implementation. Each method will be wired to the actual
-/// backend as subsystems get ported.
+/// Methods that are wired return real results. Unimplemented methods return
+/// explicit errors so callers don't mistake a noop for success.
 #[derive(Debug, Clone)]
 pub struct AnvilRpcHandler {
     /// Accounts currently being impersonated.
     impersonated: Arc<RwLock<HashSet<Address>>>,
+    /// Whether auto-impersonation is enabled.
+    auto_impersonate: Arc<RwLock<bool>>,
     /// Whether automine is enabled.
     automine: Arc<RwLock<bool>>,
 }
@@ -162,6 +169,7 @@ impl AnvilRpcHandler {
     pub fn new() -> Self {
         Self {
             impersonated: Arc::new(RwLock::new(HashSet::new())),
+            auto_impersonate: Arc::new(RwLock::new(false)),
             automine: Arc::new(RwLock::new(true)),
         }
     }
@@ -169,6 +177,8 @@ impl AnvilRpcHandler {
 
 #[async_trait]
 impl AnvilApiServer for AnvilRpcHandler {
+    // -- impersonation (wired) --
+
     async fn anvil_impersonate_account(&self, address: Address) -> RpcResult<()> {
         self.impersonated.write().insert(address);
         Ok(())
@@ -179,17 +189,15 @@ impl AnvilApiServer for AnvilRpcHandler {
         Ok(())
     }
 
-    async fn anvil_auto_impersonate_account(&self, _enabled: bool) -> RpcResult<()> {
+    async fn anvil_auto_impersonate_account(&self, enabled: bool) -> RpcResult<()> {
+        *self.auto_impersonate.write() = enabled;
         Ok(())
     }
+
+    // -- mining control (wired: state tracking, not yet triggering blocks) --
 
     async fn anvil_get_automine(&self) -> RpcResult<bool> {
         Ok(*self.automine.read())
-    }
-
-    async fn anvil_mine(&self, _blocks: Option<U256>, _interval: Option<U256>) -> RpcResult<()> {
-        // TODO: trigger mining via LocalMiner's trigger channel
-        Ok(())
     }
 
     async fn anvil_set_automine(&self, enabled: bool) -> RpcResult<()> {
@@ -197,33 +205,45 @@ impl AnvilApiServer for AnvilRpcHandler {
         Ok(())
     }
 
-    async fn anvil_set_interval_mining(&self, _interval: u64) -> RpcResult<()> {
-        Ok(())
+    // -- mining (needs engine handle) --
+
+    async fn anvil_mine(&self, _blocks: Option<U256>, _interval: Option<U256>) -> RpcResult<()> {
+        Err(not_implemented("mine"))
     }
+
+    async fn anvil_set_interval_mining(&self, _interval: u64) -> RpcResult<()> {
+        Err(not_implemented("setIntervalMining"))
+    }
+
+    async fn anvil_mine_detailed(
+        &self,
+        _opts: Option<MineOptions>,
+    ) -> RpcResult<Vec<alloy_rpc_types_eth::Block>> {
+        Err(not_implemented("mine_detailed"))
+    }
+
+    // -- pool operations (needs pool handle) --
 
     async fn anvil_drop_transaction(&self, _tx_hash: B256) -> RpcResult<Option<B256>> {
-        Ok(None)
+        Err(not_implemented("dropTransaction"))
     }
 
-    async fn anvil_reset(&self, _fork: Option<Forking>) -> RpcResult<()> {
-        Ok(())
+    async fn anvil_remove_pool_transactions(&self, _address: Address) -> RpcResult<()> {
+        Err(not_implemented("removePoolTransactions"))
     }
 
-    async fn anvil_set_rpc_url(&self, _url: String) -> RpcResult<()> {
-        Ok(())
-    }
+    // -- state manipulation (needs state overlay) --
 
     async fn anvil_set_balance(&self, _address: Address, _balance: U256) -> RpcResult<()> {
-        // TODO: direct state mutation via provider
-        Ok(())
+        Err(not_implemented("setBalance"))
     }
 
     async fn anvil_set_code(&self, _address: Address, _code: Bytes) -> RpcResult<()> {
-        Ok(())
+        Err(not_implemented("setCode"))
     }
 
     async fn anvil_set_nonce(&self, _address: Address, _nonce: U256) -> RpcResult<()> {
-        Ok(())
+        Err(not_implemented("setNonce"))
     }
 
     async fn anvil_set_storage_at(
@@ -232,98 +252,94 @@ impl AnvilApiServer for AnvilRpcHandler {
         _slot: U256,
         _value: B256,
     ) -> RpcResult<bool> {
-        Ok(true)
-    }
-
-    async fn anvil_set_coinbase(&self, _address: Address) -> RpcResult<()> {
-        Ok(())
-    }
-
-    async fn anvil_set_chain_id(&self, _chain_id: u64) -> RpcResult<()> {
-        Ok(())
-    }
-
-    async fn anvil_set_logging_enabled(&self, _enabled: bool) -> RpcResult<()> {
-        Ok(())
-    }
-
-    async fn anvil_set_min_gas_price(&self, _gas_price: U256) -> RpcResult<()> {
-        Ok(())
-    }
-
-    async fn anvil_set_next_block_base_fee_per_gas(&self, _base_fee: U256) -> RpcResult<()> {
-        Ok(())
-    }
-
-    async fn anvil_set_time(&self, _timestamp: u64) -> RpcResult<u64> {
-        Ok(0)
-    }
-
-    async fn anvil_dump_state(&self) -> RpcResult<Bytes> {
-        Ok(Bytes::new())
-    }
-
-    async fn anvil_load_state(&self, _state: Bytes) -> RpcResult<bool> {
-        Ok(true)
-    }
-
-    async fn anvil_node_info(&self) -> RpcResult<NodeInfo> {
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "not yet implemented",
-            None::<()>,
-        ))
-    }
-
-    async fn anvil_metadata(&self) -> RpcResult<Metadata> {
-        Err(jsonrpsee::types::ErrorObject::owned(
-            -32000,
-            "not yet implemented",
-            None::<()>,
-        ))
+        Err(not_implemented("setStorageAt"))
     }
 
     async fn anvil_snapshot(&self) -> RpcResult<U256> {
-        // TODO: state snapshot
-        Ok(U256::ZERO)
+        Err(not_implemented("snapshot"))
     }
 
     async fn anvil_revert(&self, _id: U256) -> RpcResult<bool> {
-        Ok(true)
+        Err(not_implemented("revert"))
     }
 
-    async fn anvil_increase_time(&self, _seconds: U256) -> RpcResult<i64> {
-        Ok(0)
+    async fn anvil_dump_state(&self) -> RpcResult<Bytes> {
+        Err(not_implemented("dumpState"))
     }
 
-    async fn anvil_set_next_block_timestamp(&self, _seconds: u64) -> RpcResult<()> {
-        Ok(())
+    async fn anvil_load_state(&self, _state: Bytes) -> RpcResult<bool> {
+        Err(not_implemented("loadState"))
+    }
+
+    // -- chain config (needs engine/config) --
+
+    async fn anvil_set_coinbase(&self, _address: Address) -> RpcResult<()> {
+        Err(not_implemented("setCoinbase"))
+    }
+
+    async fn anvil_set_chain_id(&self, _chain_id: u64) -> RpcResult<()> {
+        Err(not_implemented("setChainId"))
+    }
+
+    async fn anvil_set_min_gas_price(&self, _gas_price: U256) -> RpcResult<()> {
+        Err(not_implemented("setMinGasPrice"))
+    }
+
+    async fn anvil_set_next_block_base_fee_per_gas(&self, _base_fee: U256) -> RpcResult<()> {
+        Err(not_implemented("setNextBlockBaseFeePerGas"))
     }
 
     async fn anvil_set_block_gas_limit(&self, _gas_limit: U256) -> RpcResult<bool> {
-        Ok(true)
+        Err(not_implemented("setBlockGasLimit"))
+    }
+
+    // -- time manipulation (needs time offset) --
+
+    async fn anvil_set_time(&self, _timestamp: u64) -> RpcResult<u64> {
+        Err(not_implemented("setTime"))
+    }
+
+    async fn anvil_increase_time(&self, _seconds: U256) -> RpcResult<i64> {
+        Err(not_implemented("increaseTime"))
+    }
+
+    async fn anvil_set_next_block_timestamp(&self, _seconds: u64) -> RpcResult<()> {
+        Err(not_implemented("setNextBlockTimestamp"))
     }
 
     async fn anvil_set_block_timestamp_interval(&self, _seconds: u64) -> RpcResult<()> {
-        Ok(())
+        Err(not_implemented("setBlockTimestampInterval"))
     }
 
     async fn anvil_remove_block_timestamp_interval(&self) -> RpcResult<bool> {
-        Ok(true)
+        Err(not_implemented("removeBlockTimestampInterval"))
     }
 
-    async fn anvil_mine_detailed(
-        &self,
-        _opts: Option<MineOptions>,
-    ) -> RpcResult<Vec<alloy_rpc_types_eth::Block>> {
-        Ok(vec![])
+    // -- fork control (needs full reset infra) --
+
+    async fn anvil_reset(&self, _fork: Option<Forking>) -> RpcResult<()> {
+        Err(not_implemented("reset"))
+    }
+
+    async fn anvil_set_rpc_url(&self, _url: String) -> RpcResult<()> {
+        Err(not_implemented("setRpcUrl"))
+    }
+
+    // -- misc --
+
+    async fn anvil_set_logging_enabled(&self, _enabled: bool) -> RpcResult<()> {
+        Ok(()) // noop is fine, logging is optional
     }
 
     async fn anvil_enable_traces(&self) -> RpcResult<()> {
-        Ok(())
+        Ok(()) // noop is fine, tracing is optional
     }
 
-    async fn anvil_remove_pool_transactions(&self, _address: Address) -> RpcResult<()> {
-        Ok(())
+    async fn anvil_node_info(&self) -> RpcResult<NodeInfo> {
+        Err(not_implemented("nodeInfo"))
+    }
+
+    async fn anvil_metadata(&self) -> RpcResult<Metadata> {
+        Err(not_implemented("metadata"))
     }
 }
