@@ -1,5 +1,6 @@
 //! Anvil RPC add-ons and API implementation.
 
+use alloy_consensus::BlockHeader;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_anvil::{Forking, Metadata, MineOptions, NodeInfo};
 use alloy_rpc_types_engine::ExecutionData;
@@ -200,6 +201,8 @@ pub struct AnvilRpcHandler<Pool, Provider> {
     provider: Provider,
     /// Trigger channel to request block mining.
     mine_trigger: mpsc::Sender<()>,
+    /// Unique instance ID for this anvil node.
+    instance_id: B256,
     /// Accounts currently being impersonated.
     impersonated: Arc<RwLock<HashSet<Address>>>,
     /// Whether auto-impersonation is enabled.
@@ -224,6 +227,7 @@ impl<Pool: Clone, Provider: Clone> Clone for AnvilRpcHandler<Pool, Provider> {
             pool: self.pool.clone(),
             provider: self.provider.clone(),
             mine_trigger: self.mine_trigger.clone(),
+            instance_id: self.instance_id,
             impersonated: self.impersonated.clone(),
             auto_impersonate: self.auto_impersonate.clone(),
             automine: self.automine.clone(),
@@ -238,6 +242,7 @@ impl<Pool, Provider> AnvilRpcHandler<Pool, Provider> {
             pool,
             provider,
             mine_trigger,
+            instance_id: B256::random(),
             impersonated: Arc::new(RwLock::new(HashSet::new())),
             auto_impersonate: Arc::new(RwLock::new(false)),
             automine: Arc::new(RwLock::new(true)),
@@ -249,7 +254,7 @@ impl<Pool, Provider> AnvilRpcHandler<Pool, Provider> {
 impl<Pool, Provider> AnvilApiServer for AnvilRpcHandler<Pool, Provider>
 where
     Pool: TransactionPool + Clone + Send + Sync + 'static,
-    Provider: ChainSpecProvider<ChainSpec: EthChainSpec> + Clone + Send + Sync + 'static,
+    Provider: BlockReader + ChainSpecProvider<ChainSpec: EthChainSpec> + Clone + Send + Sync + 'static,
 {
     // -- impersonation (wired) --
 
@@ -420,10 +425,56 @@ where
     }
 
     async fn anvil_node_info(&self) -> RpcResult<NodeInfo> {
-        Err(not_implemented("nodeInfo"))
+        use alloy_rpc_types_anvil::{NodeEnvironment, NodeForkConfig};
+        use reth_storage_api::BlockIdReader;
+
+        let chain_spec = self.provider.chain_spec();
+        let best_number = self.provider.best_block_number().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+        let best_header = self.provider.sealed_header(best_number).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?.ok_or_else(|| {
+            jsonrpsee::types::ErrorObject::owned(-32000, "best header not found", None::<()>)
+        })?;
+
+        Ok(NodeInfo {
+            current_block_number: best_number,
+            current_block_timestamp: best_header.timestamp(),
+            current_block_hash: best_header.hash(),
+            hard_fork: "latest".to_string(),
+            transaction_order: "fifo".to_string(),
+            environment: NodeEnvironment {
+                base_fee: best_header.base_fee_per_gas().unwrap_or(0) as u128,
+                chain_id: chain_spec.chain().id(),
+                gas_limit: best_header.gas_limit(),
+                gas_price: best_header.base_fee_per_gas().unwrap_or(0) as u128,
+            },
+            fork_config: NodeForkConfig::default(),
+        })
     }
 
     async fn anvil_metadata(&self) -> RpcResult<Metadata> {
-        Err(not_implemented("metadata"))
+        use reth_storage_api::BlockIdReader;
+
+        let chain_spec = self.provider.chain_spec();
+        let best_number = self.provider.best_block_number().map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?;
+        let best_header = self.provider.sealed_header(best_number).map_err(|e| {
+            jsonrpsee::types::ErrorObject::owned(-32000, e.to_string(), None::<()>)
+        })?.ok_or_else(|| {
+            jsonrpsee::types::ErrorObject::owned(-32000, "best header not found", None::<()>)
+        })?;
+
+        Ok(Metadata {
+            client_version: format!("anvil-reth/v{}", env!("CARGO_PKG_VERSION")),
+            chain_id: chain_spec.chain().id(),
+            instance_id: self.instance_id,
+            latest_block_number: best_number,
+            latest_block_hash: best_header.hash(),
+            forked_network: None,
+            snapshots: Default::default(),
+        })
     }
 }
